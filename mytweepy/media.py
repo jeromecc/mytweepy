@@ -2,7 +2,7 @@
 # Copyright 2009-2022 Joshua Roesslein
 # See LICENSE for details.
 
-from tweepy.mixins import DataMapping
+from mytweepy.mixins import DataMapping
 
 
 class Media(DataMapping):

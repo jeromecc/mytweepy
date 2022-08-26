@@ -13,11 +13,11 @@ try:
     import async_lru
     import oauthlib
 except ModuleNotFoundError:
-    from tweepy.errors import TweepyException
+    from mytweepy.errors import TweepyException
     raise TweepyException(
         "tweepy.asynchronous requires aiohttp, async_lru, and oauthlib to be "
         "installed"
     )
 
-from tweepy.asynchronous.streaming import AsyncStream, AsyncStreamingClient
-from tweepy.asynchronous.client import AsyncClient
+from mytweepy.asynchronous.streaming import AsyncStream, AsyncStreamingClient
+from mytweepy.asynchronous.client import AsyncClient

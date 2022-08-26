@@ -2,58 +2,44 @@
 # Copyright 2009-2022 Joshua Roesslein
 # See LICENSE for details.
 
-# Appengine users: https://developers.google.com/appengine/docs/python/sockets/#making_httplib_use_sockets
-
-from collections import namedtuple
+import asyncio
 import json
 import logging
 from math import inf
 from platform import python_version
-import ssl
-from threading import Thread
-from time import sleep
-from typing import NamedTuple
 
-import requests
-from requests_oauthlib import OAuth1
-import urllib3
+import aiohttp
+from oauthlib.oauth1 import Client as OAuthClient
+from yarl import URL
 
-import tweepy
-from tweepy.client import BaseClient, Response
-from tweepy.errors import TweepyException
-from tweepy.models import Status
-from tweepy.tweet import Tweet
+import mytweepy
+from mytweepy.asynchronous.client import AsyncBaseClient
+from mytweepy.client import Response
+from mytweepy.errors import TweepyException
+from mytweepy.models import Status
+from mytweepy.streaming import StreamResponse, StreamRule
+from mytweepy.tweet import Tweet
 
 log = logging.getLogger(__name__)
 
-StreamResponse = namedtuple(
-    "StreamResponse", ("data", "includes", "errors", "matching_rules")
-)
 
+class AsyncBaseStream:
 
-class BaseStream:
-
-    def __init__(self, *, chunk_size=512, daemon=False, max_retries=inf,
-                 proxy=None, verify=True):
-        self.chunk_size = chunk_size
-        self.daemon = daemon
+    def __init__(self, *, max_retries=inf, proxy=None):
         self.max_retries = max_retries
-        self.proxies = {"https": proxy} if proxy else {}
-        self.verify = verify
+        self.proxy = proxy
 
-        self.running = False
-        self.session = requests.Session()
-        self.thread = None
+        self.session = None
+        self.task = None
         self.user_agent = (
             f"Python/{python_version()} "
-            f"Requests/{requests.__version__} "
-            f"Tweepy/{tweepy.__version__}"
+            f"aiohttp/{aiohttp.__version__} "
+            f"Tweepy/{mytweepy.__version__}"
         )
 
-    def _connect(self, method, url, auth=None, params=None, headers=None,
-                 body=None):
-        self.running = True
-
+    async def _connect(
+        self, method, url, params=None, headers=None, body=None
+    ):
         error_count = 0
         # https://developer.twitter.com/en/docs/twitter-api/v1/tweets/filter-realtime/guides/connecting
         # https://developer.twitter.com/en/docs/twitter-api/tweets/filtered-stream/integrate/handling-disconnections
@@ -65,122 +51,108 @@ class BaseStream:
         http_error_wait_max = 320
         http_420_error_wait_start = 60
 
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(sock_read=stall_timeout)
+            )
         self.session.headers["User-Agent"] = self.user_agent
 
         try:
-            while self.running and error_count <= self.max_retries:
+            while error_count <= self.max_retries:
                 try:
-                    with self.session.request(
+                    async with self.session.request(
                         method, url, params=params, headers=headers, data=body,
-                        timeout=stall_timeout, stream=True, auth=auth,
-                        verify=self.verify, proxies=self.proxies
+                        proxy=self.proxy
                     ) as resp:
-                        if resp.status_code == 200:
+                        if resp.status == 200:
                             error_count = 0
                             http_error_wait = http_error_wait_start
                             network_error_wait = network_error_wait_step
 
-                            self.on_connect()
-                            if not self.running:
-                                break
+                            await self.on_connect()
 
-                            for line in resp.iter_lines(
-                                chunk_size=self.chunk_size
-                            ):
+                            async for line in resp.content:
+                                line = line.strip()
                                 if line:
-                                    self.on_data(line)
+                                    await self.on_data(line)
                                 else:
-                                    self.on_keep_alive()
-                                if not self.running:
-                                    break
+                                    await self.on_keep_alive()
 
-                            if resp.raw.closed:
-                                self.on_closed(resp)
+                            await self.on_closed(resp)
                         else:
-                            self.on_request_error(resp.status_code)
-                            if not self.running:
-                                break
-                            # The error text is logged here instead of in
-                            # on_request_error to keep on_request_error
-                            # backwards-compatible. In a future version, the
-                            # Response should be passed to on_request_error.
-                            log.error(
-                                "HTTP error response text: %s", resp.text
-                            )
+                            await self.on_request_error(resp.status)
 
                             error_count += 1
 
-                            if resp.status_code == 420:
+                            if resp.status == 420:
                                 if http_error_wait < http_420_error_wait_start:
                                     http_error_wait = http_420_error_wait_start
 
-                            sleep(http_error_wait)
+                            await asyncio.sleep(http_error_wait)
 
                             http_error_wait *= 2
-                            if http_error_wait > http_error_wait_max:
-                                http_error_wait = http_error_wait_max
-                except (requests.ConnectionError, requests.Timeout,
-                        requests.exceptions.ChunkedEncodingError,
-                        ssl.SSLError, urllib3.exceptions.ReadTimeoutError,
-                        urllib3.exceptions.ProtocolError) as exc:
-                    # This is still necessary, as a SSLError can actually be
-                    # thrown when using Requests
-                    # If it's not time out treat it like any other exception
-                    if isinstance(exc, ssl.SSLError):
-                        if not (exc.args and "timed out" in str(exc.args[0])):
-                            raise
+                            if resp.status != 420:
+                                if http_error_wait > http_error_wait_max:
+                                    http_error_wait = http_error_wait_max
+                except (aiohttp.ClientConnectionError,
+                        aiohttp.ClientPayloadError) as e:
+                    await self.on_connection_error()
 
-                    self.on_connection_error()
-                    if not self.running:
-                        break
-
-                    sleep(network_error_wait)
+                    await asyncio.sleep(network_error_wait)
 
                     network_error_wait += network_error_wait_step
                     if network_error_wait > network_error_wait_max:
                         network_error_wait = network_error_wait_max
-        except Exception as exc:
-            self.on_exception(exc)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            await self.on_exception(e)
         finally:
-            self.session.close()
-            self.running = False
-            self.on_disconnect()
-
-    def _threaded_connect(self, *args, **kwargs):
-        self.thread = Thread(target=self._connect, name="Tweepy Stream",
-                             args=args, kwargs=kwargs, daemon=self.daemon)
-        self.thread.start()
-        return self.thread
+            await self.session.close()
+            await self.on_disconnect()
 
     def disconnect(self):
         """Disconnect the stream"""
-        self.running = False
+        if self.task is not None:
+            self.task.cancel()
 
-    def on_closed(self, response):
-        """This is called when the stream has been closed by Twitter.
+    async def on_closed(self, resp):
+        """|coroutine|
+
+        This is called when the stream has been closed by Twitter.
 
         Parameters
         ----------
-        response : requests.Response
-            The Response from Twitter
+        response : aiohttp.ClientResponse
+            The response from Twitter
         """
         log.error("Stream connection closed by Twitter")
 
-    def on_connect(self):
-        """This is called after successfully connecting to the streaming API.
+    async def on_connect(self):
+        """|coroutine|
+
+        This is called after successfully connecting to the streaming API.
         """
         log.info("Stream connected")
 
-    def on_connection_error(self):
-        """This is called when the stream connection errors or times out."""
+    async def on_connection_error(self):
+        """|coroutine|
+
+        This is called when the stream connection errors or times out.
+        """
         log.error("Stream connection has errored or timed out")
 
-    def on_disconnect(self):
-        """This is called when the stream has disconnected."""
+    async def on_disconnect(self):
+        """|coroutine|
+
+        This is called when the stream has disconnected.
+        """
         log.info("Stream disconnected")
 
-    def on_exception(self, exception):
-        """This is called when an unhandled exception occurs.
+    async def on_exception(self, exception):
+        """|coroutine|
+
+        This is called when an unhandled exception occurs.
 
         Parameters
         ----------
@@ -189,69 +161,62 @@ class BaseStream:
         """
         log.exception("Stream encountered an exception")
 
-    def on_keep_alive(self):
-        """This is called when a keep-alive signal is received."""
+    async def on_keep_alive(self):
+        """|coroutine|
+
+        This is called when a keep-alive signal is received.
+        """
         log.debug("Received keep-alive signal")
 
-    def on_request_error(self, status_code):
-        """This is called when a non-200 HTTP status code is encountered.
+    async def on_request_error(self, status_code):
+        """|coroutine|
+
+        This is called when a non-200 HTTP status code is encountered.
 
         Parameters
         ----------
         status_code : int
             The HTTP status code encountered
         """
-        log.error("Stream encountered HTTP error: %d", status_code)
+        log.error("Stream encountered HTTP Error: %d", status_code)
 
 
-class Stream(BaseStream):
-    """Filter and sample realtime Tweets with Twitter API v1.1
+class AsyncStream(AsyncBaseStream):
+    """Stream realtime Tweets asynchronously with Twitter API v1.1
 
     .. note::
 
         New Twitter Developer Apps created on or after April 29, 2022 `will not
         be able to gain access to v1.1 statuses/sample and v1.1
-        statuses/filter`_, the Twitter API v1.1 endpoints that :class:`Stream`
-        uses. Twitter API v2 can be used instead with :class:`StreamingClient`.
+        statuses/filter`_, the Twitter API v1.1 endpoints that
+        :class:`AsyncStream` uses. Twitter API v2 can be used instead with
+        :class:`AsyncStreamingClient`.
+
+    .. versionadded:: 4.0
 
     Parameters
     ----------
-    consumer_key : str
+    consumer_key: str
         Twitter API Consumer Key
-    consumer_secret : str
+    consumer_secret: str
         Twitter API Consumer Secret
     access_token: str
         Twitter API Access Token
-    access_token_secret : str
+    access_token_secret: str
         Twitter API Access Token Secret
-    chunk_size : int
-        The default socket.read size. Default to 512, less than half the size
-        of a Tweet so that it reads Tweets with the minimal latency of 2 reads
-        per Tweet. Values higher than ~1kb will increase latency by waiting for
-        more data to arrive but may also increase throughput by doing fewer
-        socket read calls.
-    daemon : bool
-        Whether or not to use a daemon thread when using a thread to run the
-        stream
-    max_retries : int
-        Max number of times to retry connecting the stream
-    proxy : str | None
+    max_retries: int | None
+        Number of times to attempt to (re)connect the stream.
+    proxy: str | None
         URL of the proxy to use when connecting to the stream
-    verify : bool | str
-        Either a boolean, in which case it controls whether to verify the
-        server’s TLS certificate, or a string, in which case it must be a path
-        to a CA bundle to use.
 
     Attributes
     ----------
-    running : bool
-        Whether there's currently a stream running
-    session : :class:`requests.Session`
-        Requests Session used to connect to the stream
-    thread : :class:`threading.Thread` | None
-        Thread used to run the stream
+    session : aiohttp.ClientSession | None
+        Aiohttp client session used to connect to the API
+    task : asyncio.Task | None
+        The task running the stream
     user_agent : str
-        User agent used when connecting to the stream
+        User agent used when connecting to the API
 
 
     .. _will not be able to gain access to v1.1 statuses/sample and v1.1
@@ -262,8 +227,7 @@ class Stream(BaseStream):
                  access_token_secret, **kwargs):
         """__init__( \
             consumer_key, consumer_secret, access_token, access_token_secret, \
-            chunk_size=512, daemon=False, max_retries=inf, proxy=None, \
-            verify=True \
+            *, max_retries=inf, proxy=None \
         )
         """
         self.consumer_key = consumer_key
@@ -272,32 +236,44 @@ class Stream(BaseStream):
         self.access_token_secret = access_token_secret
         super().__init__(**kwargs)
 
-    def _connect(self, method, endpoint, **kwargs):
-        auth = OAuth1(self.consumer_key, self.consumer_secret,
-                      self.access_token, self.access_token_secret)
+    async def _connect(
+        self, method, endpoint, params={}, headers=None, body=None
+    ):
+        oauth_client = OAuthClient(self.consumer_key, self.consumer_secret,
+                                   self.access_token, self.access_token_secret)
         url = f"https://stream.twitter.com/1.1/{endpoint}.json"
-        super()._connect(method, url, auth=auth, **kwargs)
+        url = str(URL(url).with_query(sorted(params.items())))
+        url, headers, body = oauth_client.sign(
+            url, http_method=method, headers=headers, body=body
+        )
+        await super()._connect(method, url, headers=headers, body=body)
 
     def filter(self, *, follow=None, track=None, locations=None,
-               filter_level=None, languages=None, stall_warnings=False,
-               threaded=False):
+               filter_level=None, languages=None, stall_warnings=False):
         """Filter realtime Tweets
 
-        .. deprecated:: 4.9
+        .. deprecated:: 4.10
             `The delivery of compliance messages through the Twitter API v1.1
             endpoint this method uses has been deprecated, and they will stop
             being delivered beginning October 29, 2022.`_ Twitter API v2 can be
-            used instead with :meth:`StreamingClient.filter` and/or
-            :class:`Client` :ref:`batch compliance <Batch compliance>` methods.
+            used instead with :meth:`AsyncStreamingClient.filter` and/or
+            :class:`AsyncClient` :ref:`batch compliance <Batch compliance>`
+            methods.
 
         Parameters
         ----------
-        follow : list[int | str] | None
-            User IDs, indicating the users to return statuses for in the stream
-        track : list[str] | None
-            Keywords to track
-        locations : list[float] | None
-            Specifies a set of bounding boxes to track
+        follow: list[int | str] | None
+            A list of user IDs, indicating the users to return statuses for in
+            the stream. See https://developer.twitter.com/en/docs/twitter-api/v1/tweets/filter-realtime/guides/basic-stream-parameters
+            for more information.
+        track: list[str] | None
+            Keywords to track. Phrases of keywords are specified by a list. See
+            https://developer.twitter.com/en/docs/tweets/filter-realtime/guides/basic-stream-parameters
+            for more information.
+        locations: list[float] | None
+            Specifies a set of bounding boxes to track. See
+            https://developer.twitter.com/en/docs/tweets/filter-realtime/guides/basic-stream-parameters
+            for more information.
         filter_level : str | None
             Setting this parameter to one of none, low, or medium will set the
             minimum value of the filter_level Tweet attribute required to be
@@ -314,10 +290,10 @@ class Stream(BaseStream):
             have been detected as being written in the specified languages. For
             example, connecting with language=en will only stream Tweets
             detected to be in the English language.
-        stall_warnings : bool
-            Specifies whether stall warnings should be delivered
-        threaded : bool
-            Whether or not to use a thread to run the stream
+        stall_warnings: bool | None
+            Specifies whether stall warnings should be delivered. See
+            https://developer.twitter.com/en/docs/tweets/filter-realtime/guides/basic-stream-parameters
+            for more information.
 
         Raises
         ------
@@ -327,8 +303,8 @@ class Stream(BaseStream):
 
         Returns
         -------
-        threading.Thread | None
-            The thread if ``threaded`` is set to ``True``, else ``None``
+        asyncio.Task
+            The task running the stream
 
         References
         ----------
@@ -340,44 +316,45 @@ class Stream(BaseStream):
             endpoint this method uses has been deprecated, and they will stop
             being delivered beginning October 29, 2022.: https://twittercommunity.com/t/deprecation-announcement-removing-compliance-messages-from-statuses-filter-and-retiring-statuses-sample-from-the-twitter-api-v1-1/170500
         """
-        if self.running:
+        if self.task is not None and not self.task.done():
             raise TweepyException("Stream is already connected")
 
-        method = "POST"
         endpoint = "statuses/filter"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
         body = {}
-        if follow:
+        if follow is not None:
             body["follow"] = ','.join(map(str, follow))
-        if track:
+        if track is not None:
             body["track"] = ','.join(map(str, track))
-        if locations and len(locations) > 0:
+        if locations is not None:
             if len(locations) % 4:
                 raise TweepyException(
                     "Number of location coordinates should be a multiple of 4"
                 )
-            body["locations"] = ','.join(f"{l:.4f}" for l in locations)
-        if filter_level:
+            body["locations"] = ','.join(
+                f"{location:.4f}" for location in locations
+            )
+        if filter_level is not None:
             body["filter_level"] = filter_level
-        if languages:
+        if languages is not None:
             body["language"] = ','.join(map(str, languages))
         if stall_warnings:
-            body["stall_warnings"] = stall_warnings
+            body["stall_warnings"] = "true"
 
-        if threaded:
-            return self._threaded_connect(method, endpoint, headers=headers,
-                                          body=body)
-        else:
-            self._connect(method, endpoint, headers=headers, body=body)
+        self.task = asyncio.create_task(
+            self._connect("POST", endpoint, headers=headers, body=body or None)
+        )
+        # Use name parameter when support for Python 3.7 is dropped
+        return self.task
 
-    def sample(self, *, languages=None, stall_warnings=False, threaded=False):
+    def sample(self, *, languages=None, stall_warnings=False):
         """Sample realtime Tweets
 
-        .. deprecated:: 4.9
+        .. deprecated:: 4.10
             `The Twitter API v1.1 endpoint this method uses is now deprecated
             and will be retired on October 29, 2022.`_ Twitter API v2 can be
-            used instead with :meth:`StreamingClient.sample`.
+            used instead with :meth:`AsyncStreamingClient.sample`.
 
         Parameters
         ----------
@@ -388,10 +365,10 @@ class Stream(BaseStream):
             have been detected as being written in the specified languages. For
             example, connecting with language=en will only stream Tweets
             detected to be in the English language.
-        stall_warnings : bool
-            Specifies whether stall warnings should be delivered
-        threaded : bool
-            Whether or not to use a thread to run the stream
+        stall_warnings: bool | None
+            Specifies whether stall warnings should be delivered. See
+            https://developer.twitter.com/en/docs/tweets/filter-realtime/guides/basic-stream-parameters
+            for more information.
 
         Raises
         ------
@@ -400,8 +377,8 @@ class Stream(BaseStream):
 
         Returns
         -------
-        threading.Thread | None
-            The thread if ``threaded`` is set to ``True``, else ``None``
+        asyncio.Task
+            The task running the stream
 
         References
         ----------
@@ -412,26 +389,28 @@ class Stream(BaseStream):
         .. _The Twitter API v1.1 endpoint this method uses is now deprecated
             and will be retired on October 29, 2022.: https://twittercommunity.com/t/deprecation-announcement-removing-compliance-messages-from-statuses-filter-and-retiring-statuses-sample-from-the-twitter-api-v1-1/170500
         """
-        if self.running:
+        if self.task is not None and not self.task.done():
             raise TweepyException("Stream is already connected")
 
-        method = "GET"
         endpoint = "statuses/sample"
 
         params = {}
-        if languages:
+        if languages is not None:
             params["language"] = ','.join(map(str, languages))
         if stall_warnings:
             params["stall_warnings"] = "true"
 
-        if threaded:
-            return self._threaded_connect(method, endpoint, params=params)
-        else:
-            self._connect(method, endpoint, params=params)
+        self.task = asyncio.create_task(
+            self._connect("GET", endpoint, params=params)
+        )
+        # Use name parameter when support for Python 3.7 is dropped
+        return self.task
 
-    def on_data(self, raw_data):
-        """This is called when raw data is received from the stream.
-        This method handles sending the data to other methods based on the
+    async def on_data(self, raw_data):
+        """|coroutine|
+
+        This is called when raw data is received from the stream.
+        This method handles sending the data to other methods, depending on the
         message type.
 
         Parameters
@@ -447,27 +426,29 @@ class Stream(BaseStream):
 
         if "in_reply_to_status_id" in data:
             status = Status.parse(None, data)
-            return self.on_status(status)
+            return await self.on_status(status)
         if "delete" in data:
             delete = data["delete"]["status"]
-            return self.on_delete(delete["id"], delete["user_id"])
+            return await self.on_delete(delete["id"], delete["user_id"])
         if "disconnect" in data:
-            return self.on_disconnect_message(data["disconnect"])
+            return await self.on_disconnect_message(data["disconnect"])
         if "limit" in data:
-            return self.on_limit(data["limit"]["track"])
+            return await self.on_limit(data["limit"]["track"])
         if "scrub_geo" in data:
-            return self.on_scrub_geo(data["scrub_geo"])
+            return await self.on_scrub_geo(data["scrub_geo"])
         if "status_withheld" in data:
-            return self.on_status_withheld(data["status_withheld"])
+            return await self.on_status_withheld(data["status_withheld"])
         if "user_withheld" in data:
-            return self.on_user_withheld(data["user_withheld"])
+            return await self.on_user_withheld(data["user_withheld"])
         if "warning" in data:
-            return self.on_warning(data["warning"])
+            return await self.on_warning(data["warning"])
 
-        log.error("Received unknown message type: %s", raw_data)
+        log.warning("Received unknown message type: %s", raw_data)
 
-    def on_status(self, status):
-        """This is called when a status is received.
+    async def on_status(self, status):
+        """|coroutine|
+
+        This is called when a status is received.
 
         Parameters
         ----------
@@ -476,8 +457,10 @@ class Stream(BaseStream):
         """
         log.debug("Received status: %d", status.id)
 
-    def on_delete(self, status_id, user_id):
-        """This is called when a status deletion notice is received.
+    async def on_delete(self, status_id, user_id):
+        """|coroutine|
+
+        This is called when a status deletion notice is received.
 
         Parameters
         ----------
@@ -488,8 +471,10 @@ class Stream(BaseStream):
         """
         log.debug("Received status deletion notice: %d", status_id)
 
-    def on_disconnect_message(self, message):
-        """This is called when a disconnect message is received.
+    async def on_disconnect_message(self, message):
+        """|coroutine|
+
+        This is called when a disconnect message is received.
 
         Parameters
         ----------
@@ -498,8 +483,10 @@ class Stream(BaseStream):
         """
         log.warning("Received disconnect message: %s", message)
 
-    def on_limit(self, track):
-        """This is called when a limit notice is received.
+    async def on_limit(self, track):
+        """|coroutine|
+
+        This is called when a limit notice is received.
 
         Parameters
         ----------
@@ -509,8 +496,10 @@ class Stream(BaseStream):
         """
         log.debug("Received limit notice: %d", track)
 
-    def on_scrub_geo(self, notice):
-        """This is called when a location deletion notice is received.
+    async def on_scrub_geo(self, notice):
+        """|coroutine|
+
+        This is called when a location deletion notice is received.
 
         Parameters
         ----------
@@ -519,8 +508,10 @@ class Stream(BaseStream):
         """
         log.debug("Received location deletion notice: %s", notice)
 
-    def on_status_withheld(self, notice):
-        """This is called when a status withheld content notice is received.
+    async def on_status_withheld(self, notice):
+        """|coroutine|
+
+        This is called when a status withheld content notice is received.
 
         Parameters
         ----------
@@ -529,8 +520,10 @@ class Stream(BaseStream):
         """
         log.debug("Received status withheld content notice: %s", notice)
 
-    def on_user_withheld(self, notice):
-        """This is called when a user withheld content notice is received.
+    async def on_user_withheld(self, notice):
+        """|coroutine|
+
+        This is called when a user withheld content notice is received.
 
         Parameters
         ----------
@@ -539,21 +532,23 @@ class Stream(BaseStream):
         """
         log.debug("Received user withheld content notice: %s", notice)
 
-    def on_warning(self, warning):
-        """This is called when a stall warning message is received.
+    async def on_warning(self, notice):
+        """|coroutine|
+
+        This is called when a stall warning message is received.
 
         Parameters
         ----------
         warning : JSON
             The stall warning
         """
-        log.warning("Received stall warning: %s", warning)
+        log.warning("Received stall warning: %s", notice)
 
 
-class StreamingClient(BaseClient, BaseStream):
-    """Filter and sample realtime Tweets with Twitter API v2
+class AsyncStreamingClient(AsyncBaseClient, AsyncBaseStream):
+    """Stream realtime Tweets asynchronously with Twitter API v2
 
-    .. versionadded:: 4.6
+    .. versionadded:: 4.10
 
     Parameters
     ----------
@@ -563,52 +558,36 @@ class StreamingClient(BaseClient, BaseStream):
         Type to return from requests to the API
     wait_on_rate_limit : bool
         Whether to wait when rate limit is reached
-    chunk_size : int
-        The default socket.read size. Default to 512, less than half the size
-        of a Tweet so that it reads Tweets with the minimal latency of 2 reads
-        per Tweet. Values higher than ~1kb will increase latency by waiting for
-        more data to arrive but may also increase throughput by doing fewer
-        socket read calls.
-    daemon : bool
-        Whether or not to use a daemon thread when using a thread to run the
-        stream
-    max_retries : int
-        Max number of times to retry connecting the stream
+    max_retries: int | None
+        Number of times to attempt to (re)connect the stream.
     proxy : str | None
         URL of the proxy to use when connecting to the stream
-    verify : bool | str
-        Either a boolean, in which case it controls whether to verify the
-        server’s TLS certificate, or a string, in which case it must be a path
-        to a CA bundle to use.
 
     Attributes
     ----------
-    running : bool
-        Whether there's currently a stream running
-    session : :class:`requests.Session`
-        Requests Session used to connect to the stream
-    thread : :class:`threading.Thread` | None
-        Thread used to run the stream
+    session : aiohttp.ClientSession | None
+        Aiohttp client session used to connect to the API
+    task : asyncio.Task | None
+        The task running the stream
     user_agent : str
-        User agent used when connecting to the stream
+        User agent used when connecting to the API
     """
 
     def __init__(self, bearer_token, *, return_type=Response,
                  wait_on_rate_limit=False, **kwargs):
         """__init__( \
             bearer_token, *, return_type=Response, wait_on_rate_limit=False, \
-            chunk_size=512, daemon=False, max_retries=inf, proxy=None, \
-            verify=True \
+            max_retries=inf, proxy=None \
         )
         """
-        BaseClient.__init__(self, bearer_token, return_type=return_type,
-                            wait_on_rate_limit=wait_on_rate_limit)
-        BaseStream.__init__(self, **kwargs)
+        AsyncBaseClient.__init__(self, bearer_token, return_type=return_type,
+                                 wait_on_rate_limit=wait_on_rate_limit)
+        AsyncBaseStream.__init__(self, **kwargs)
 
-    def _connect(self, method, endpoint, **kwargs):
-        self.session.headers["Authorization"] = f"Bearer {self.bearer_token}"
+    async def _connect(self, method, endpoint, **kwargs):
         url = f"https://api.twitter.com/2/tweets/{endpoint}/stream"
-        super()._connect(method, url, **kwargs)
+        headers = {"Authorization": f"Bearer {self.bearer_token}"}
+        await super()._connect(method, url, headers=headers, **kwargs)
 
     def _process_data(self, data, data_type=None):
         if data_type is StreamRule:
@@ -632,8 +611,10 @@ class StreamingClient(BaseClient, BaseStream):
         else:
             super()._process_data(data, data_type=data_type)
 
-    def add_rules(self, add, **params):
+    async def add_rules(self, add, **params):
         """add_rules(add, *, dry_run)
+
+        |coroutine|
 
         Add rules to filtered stream.
 
@@ -663,13 +644,15 @@ class StreamingClient(BaseClient, BaseStream):
             else:
                 json["add"].append({"value": rule.value})
 
-        return self._make_request(
+        return await self._make_request(
             "POST", f"/2/tweets/search/stream/rules", params=params,
             endpoint_parameters=("dry_run",), json=json, data_type=StreamRule
         )
 
-    def delete_rules(self, ids, **params):
+    async def delete_rules(self, ids, **params):
         """delete_rules(ids, *, dry_run)
+
+        |coroutine|
 
         Delete rules from filtered stream.
 
@@ -700,16 +683,16 @@ class StreamingClient(BaseClient, BaseStream):
             else:
                 json["delete"]["ids"].append(str(id))
 
-        return self._make_request(
+        return await self._make_request(
             "POST", f"/2/tweets/search/stream/rules", params=params,
             endpoint_parameters=("dry_run",), json=json, data_type=StreamRule
         )
 
-    def filter(self, *, threaded=False, **params):
+    def filter(self, **params):
         """filter( \
             *, backfill_minutes=None, expansions=None, media_fields=None, \
             place_fields=None, poll_fields=None, tweet_fields=None, \
-            user_fields=None, threaded=False \
+            user_fields=None \
         )
 
         Streams Tweets in real-time based on a specific set of filter rules.
@@ -752,8 +735,6 @@ class StreamingClient(BaseClient, BaseStream):
             :ref:`tweet_fields_parameter`
         user_fields : list[str] | str
             :ref:`user_fields_parameter`
-        threaded : bool
-            Whether or not to use a thread to run the stream
 
         Raises
         ------
@@ -762,8 +743,8 @@ class StreamingClient(BaseClient, BaseStream):
 
         Returns
         -------
-        threading.Thread | None
-            The thread if ``threaded`` is set to ``True``, else ``None``
+        asyncio.Task
+            The task running the stream
 
         References
         ----------
@@ -772,10 +753,9 @@ class StreamingClient(BaseClient, BaseStream):
         .. _filter redundant connections: https://developer.twitter.com/en/docs/twitter-api/tweets/filtered-stream/integrate/recovery-and-redundancy-features
         .. _Tweet cap: https://developer.twitter.com/en/docs/twitter-api/tweet-caps
         """
-        if self.running:
+        if self.task is not None and not self.task.done():
             raise TweepyException("Stream is already connected")
 
-        method = "GET"
         endpoint = "search"
 
         params = self._process_params(
@@ -785,13 +765,16 @@ class StreamingClient(BaseClient, BaseStream):
             )
         )
 
-        if threaded:
-            return self._threaded_connect(method, endpoint, params=params)
-        else:
-            self._connect(method, endpoint, params=params)
+        self.task = asyncio.create_task(
+            self._connect("GET", endpoint, params=params)
+        )
+        # Use name parameter when support for Python 3.7 is dropped
+        return self.task
 
-    def get_rules(self, **params):
+    async def get_rules(self, **params):
         """get_rules(*, ids)
+
+        |coroutine|
 
         Return a list of rules currently active on the streaming endpoint,
         either as a list or individually.
@@ -810,16 +793,16 @@ class StreamingClient(BaseClient, BaseStream):
         ----------
         https://developer.twitter.com/en/docs/twitter-api/tweets/filtered-stream/api-reference/get-tweets-search-stream-rules
         """
-        return self._make_request(
+        return await self._make_request(
             "GET", f"/2/tweets/search/stream/rules", params=params,
             endpoint_parameters=("ids",), data_type=StreamRule
         )
 
-    def sample(self, *, threaded=False, **params):
+    def sample(self, **params):
         """sample( \
             *, backfill_minutes=None, expansions=None, media_fields=None, \
             place_fields=None, poll_fields=None, tweet_fields=None, \
-            user_fields=None, threaded=False \
+            user_fields=None \
         )
 
         Streams about 1% of all Tweets in real-time.
@@ -859,8 +842,6 @@ class StreamingClient(BaseClient, BaseStream):
             :ref:`tweet_fields_parameter`
         user_fields : list[str] | str
             :ref:`user_fields_parameter`
-        threaded : bool
-            Whether or not to use a thread to run the stream
 
         Raises
         ------
@@ -869,8 +850,8 @@ class StreamingClient(BaseClient, BaseStream):
 
         Returns
         -------
-        threading.Thread | None
-            The thread if ``threaded`` is set to ``True``, else ``None``
+        asyncio.Task
+            The task running the stream
 
         References
         ----------
@@ -878,10 +859,9 @@ class StreamingClient(BaseClient, BaseStream):
 
         .. _sample redundant connections: https://developer.twitter.com/en/docs/twitter-api/tweets/volume-streams/integrate/recovery-and-redundancy-features
         """
-        if self.running:
+        if self.task is not None and not self.task.done():
             raise TweepyException("Stream is already connected")
 
-        method = "GET"
         endpoint = "sample"
 
         params = self._process_params(
@@ -891,13 +871,16 @@ class StreamingClient(BaseClient, BaseStream):
             )
         )
 
-        if threaded:
-            return self._threaded_connect(method, endpoint, params=params)
-        else:
-            self._connect(method, endpoint, params=params)
+        self.task = asyncio.create_task(
+            self._connect("GET", endpoint, params=params)
+        )
+        # Use name parameter when support for Python 3.7 is dropped
+        return self.task
 
-    def on_data(self, raw_data):
-        """This is called when raw data is received from the stream.
+    async def on_data(self, raw_data):
+        """|coroutine|
+
+        This is called when raw data is received from the stream.
         This method handles sending the data to other methods.
 
         Parameters
@@ -918,26 +901,28 @@ class StreamingClient(BaseClient, BaseStream):
 
         if "data" in data:
             tweet = Tweet(data["data"])
-            self.on_tweet(tweet)
+            await self.on_tweet(tweet)
         if "includes" in data:
             includes = self._process_includes(data["includes"])
-            self.on_includes(includes)
+            await self.on_includes(includes)
         if "errors" in data:
             errors = data["errors"]
-            self.on_errors(errors)
+            await self.on_errors(errors)
         if "matching_rules" in data:
             matching_rules = [
                 StreamRule(id=rule["id"], tag=rule["tag"])
                 for rule in data["matching_rules"]
             ]
-            self.on_matching_rules(matching_rules)
+            await self.on_matching_rules(matching_rules)
 
-        self.on_response(
+        await self.on_response(
             StreamResponse(tweet, includes, errors, matching_rules)
         )
 
-    def on_tweet(self, tweet):
-        """This is called when a Tweet is received.
+    async def on_tweet(self, tweet):
+        """|coroutine|
+
+        This is called when a Tweet is received.
 
         Parameters
         ----------
@@ -946,8 +931,10 @@ class StreamingClient(BaseClient, BaseStream):
         """
         pass
 
-    def on_includes(self, includes):
-        """This is called when includes are received.
+    async def on_includes(self, includes):
+        """|coroutine|
+
+        This is called when includes are received.
 
         Parameters
         ----------
@@ -956,8 +943,10 @@ class StreamingClient(BaseClient, BaseStream):
         """
         pass
 
-    def on_errors(self, errors):
-        """This is called when errors are received.
+    async def on_errors(self, errors):
+        """|coroutine|
+
+        This is called when errors are received.
 
         Parameters
         ----------
@@ -966,8 +955,10 @@ class StreamingClient(BaseClient, BaseStream):
         """
         log.error("Received errors: %s", errors)
 
-    def on_matching_rules(self, matching_rules):
-        """This is called when matching rules are received.
+    async def on_matching_rules(self, matching_rules):
+        """|coroutine|
+
+        This is called when matching rules are received.
 
         Parameters
         ----------
@@ -976,8 +967,10 @@ class StreamingClient(BaseClient, BaseStream):
         """
         pass
 
-    def on_response(self, response):
-        """This is called when a response is received.
+    async def on_response(self, response):
+        """|coroutine|
+
+        This is called when a response is received.
 
         Parameters
         ----------
@@ -985,36 +978,3 @@ class StreamingClient(BaseClient, BaseStream):
             The response received
         """
         log.debug("Received response: %s", response)
-
-
-class StreamRule(NamedTuple):
-    """Rule for filtered stream
-
-    .. versionadded:: 4.6
-
-    Parameters
-    ----------
-    value : str | None
-        The rule text. If you are using a `Standard Project`_ at the Basic
-        `access level`_, you can use the basic set of `operators`_, can submit
-        up to 25 concurrent rules, and can submit rules up to 512 characters
-        long. If you are using an `Academic Research Project`_ at the Basic
-        access level, you can use all available operators, can submit up to
-        1,000 concurrent rules, and can submit rules up to 1,024 characters
-        long.
-    tag : str | None
-        The tag label. This is a free-form text you can use to identify the
-        rules that matched a specific Tweet in the streaming response. Tags can
-        be the same across rules.
-    id : str | None
-        Unique identifier of this rule. This is returned as a string.
-
-
-    .. _Standard Project: https://developer.twitter.com/en/docs/projects
-    .. _access level: https://developer.twitter.com/en/products/twitter-api/early-access/guide#na_1
-    .. _operators: https://developer.twitter.com/en/docs/twitter-api/tweets/search/integrate/build-a-query
-    .. _Academic Research Project: https://developer.twitter.com/en/docs/projects
-    """
-    value: str = None
-    tag: str = None
-    id: str = None

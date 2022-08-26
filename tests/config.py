@@ -3,8 +3,8 @@ import unittest
 
 import vcr
 
-from tweepy.api import API
-from tweepy.auth import OAuth1UserHandler
+from mytweepy.api import API
+from mytweepy.auth import OAuth1UserHandler
 
 
 user_id = os.environ.get('TWITTER_USER_ID', '1072250532645998596')

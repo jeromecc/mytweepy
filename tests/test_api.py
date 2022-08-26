@@ -6,8 +6,8 @@ from ast import literal_eval
 
 from config import tape, TweepyTestCase, username
 from tweepy import API, FileCache, MemoryCache
-from tweepy.models import Friendship
-from tweepy.parsers import Parser
+from mytweepy.models import Friendship
+from mytweepy.parsers import Parser
 
 test_tweet_id = '266367358078169089'
 tweet_text = 'testing 1000'
@@ -19,7 +19,7 @@ class TweepyAPITests(TweepyTestCase):
 
     #@tape.use_cassette('testfailure.json')
     #def testapierror(self):
-    #    from tweepy.errors import TweepyException
+    #    from mytweepy.errors import TweepyException
     #
     #    with self.assertRaises(TweepyException) as cm:
     #        self.api.direct_messages()

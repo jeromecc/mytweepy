@@ -3,7 +3,7 @@
 import re
 from setuptools import find_packages, setup
 
-VERSION_FILE = "tweepy/__init__.py"
+VERSION_FILE = "mytweepy/__init__.py"
 with open(VERSION_FILE) as version_file:
     match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]",
                       version_file.read(), re.MULTILINE)
@@ -17,7 +17,7 @@ with open("README.md") as readme_file:
     long_description = readme_file.read()
 
 setup(
-    name="tweepy",
+    name="mytweepy",
     version=version,
     description="Twitter library for Python",
     long_description=long_description,
@@ -29,7 +29,7 @@ setup(
     project_urls={
         "Documentation": "https://tweepy.readthedocs.io",
         "Issue Tracker": "https://github.com/tweepy/tweepy/issues",
-        "Source Code": "https://github.com/tweepy/tweepy",
+        "Source Code": "https://github.com/jeromecc/mytweepy",
     },
     download_url="https://pypi.org/project/tweepy/",
     packages=find_packages(),

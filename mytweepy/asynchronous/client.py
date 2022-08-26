@@ -18,16 +18,16 @@ from async_lru import alru_cache
 from oauthlib.oauth1 import Client as OAuthClient
 from yarl import URL
 
-import tweepy
-from tweepy.client import BaseClient, Response
-from tweepy.errors import (
+import mytweepy
+from mytweepy.client import BaseClient, Response
+from mytweepy.errors import (
     BadRequest, Forbidden, HTTPException, NotFound, TooManyRequests,
     TwitterServerError, Unauthorized
 )
-from tweepy.list import List
-from tweepy.space import Space
-from tweepy.tweet import Tweet
-from tweepy.user import User
+from mytweepy.list import List
+from mytweepy.space import Space
+from mytweepy.tweet import Tweet
+from mytweepy.user import User
 
 async_cache = alru_cache(maxsize=None)
 
@@ -54,7 +54,7 @@ class AsyncBaseClient(BaseClient):
         self.user_agent = (
             f"Python/{python_version()} "
             f"aiohttp/{aiohttp.__version__} "
-            f"Tweepy/{tweepy.__version__}"
+            f"Tweepy/{mytweepy.__version__}"
         )
 
     async def request(

@@ -1,6 +1,6 @@
 import unittest
 
-from tweepy.utils import *
+from mytweepy.utils import *
 
 
 class TweepyUtilsTests(unittest.TestCase):

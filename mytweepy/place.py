@@ -2,7 +2,7 @@
 # Copyright 2009-2022 Joshua Roesslein
 # See LICENSE for details.
 
-from tweepy.mixins import DataMapping, HashableID
+from mytweepy.mixins import DataMapping, HashableID
 
 
 class Place(HashableID, DataMapping):

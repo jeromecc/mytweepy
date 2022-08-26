@@ -3,7 +3,7 @@ import unittest
 
 from config import create_auth
 from tweepy import API
-from tweepy.errors import HTTPException
+from mytweepy.errors import HTTPException
 
 
 testratelimit = 'TEST_RATE_LIMIT' in os.environ

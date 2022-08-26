@@ -18,19 +18,19 @@ import warnings
 
 import requests
 
-import tweepy
-from tweepy.auth import OAuth1UserHandler
-from tweepy.errors import (
+import mytweepy
+from mytweepy.auth import OAuth1UserHandler
+from mytweepy.errors import (
     BadRequest, Forbidden, HTTPException, NotFound, TooManyRequests,
     TwitterServerError, Unauthorized
 )
-from tweepy.list import List
-from tweepy.media import Media
-from tweepy.place import Place
-from tweepy.poll import Poll
-from tweepy.space import Space
-from tweepy.tweet import Tweet
-from tweepy.user import User
+from mytweepy.list import List
+from mytweepy.media import Media
+from mytweepy.place import Place
+from mytweepy.poll import Poll
+from mytweepy.space import Space
+from mytweepy.tweet import Tweet
+from mytweepy.user import User
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ class BaseClient:
         self.user_agent = (
             f"Python/{python_version()} "
             f"Requests/{requests.__version__} "
-            f"Tweepy/{tweepy.__version__}"
+            f"Tweepy/{mytweepy.__version__}"
         )
 
     def request(self, method, route, params=None, json=None, user_auth=False):

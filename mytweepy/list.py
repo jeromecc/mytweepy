@@ -2,8 +2,8 @@
 # Copyright 2009-2022 Joshua Roesslein
 # See LICENSE for details.
 
-from tweepy.mixins import DataMapping, HashableID
-from tweepy.utils import parse_datetime
+from mytweepy.mixins import DataMapping, HashableID
+from mytweepy.utils import parse_datetime
 
 
 class List(HashableID, DataMapping):

@@ -1,5 +1,5 @@
 from config import TweepyTestCase
-from tweepy.models import ResultSet
+from mytweepy.models import ResultSet
 
 
 class NoIdItem:

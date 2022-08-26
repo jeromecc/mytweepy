@@ -14,14 +14,14 @@ from urllib.parse import urlencode
 
 import requests
 
-import tweepy
-from tweepy.errors import (
+import mytweepy
+from mytweepy.errors import (
     BadRequest, Forbidden, HTTPException, NotFound, TooManyRequests,
     TweepyException, TwitterServerError, Unauthorized
 )
-from tweepy.models import Model
-from tweepy.parsers import ModelParser, Parser
-from tweepy.utils import list_to_csv
+from mytweepy.models import Model
+from mytweepy.parsers import ModelParser, Parser
+from mytweepy.utils import list_to_csv
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class API:
             user_agent = (
                 f"Python/{python_version()} "
                 f"Requests/{requests.__version__} "
-                f"Tweepy/{tweepy.__version__}"
+                f"Tweepy/{mytweepy.__version__}"
             )
         self.user_agent = user_agent
 
